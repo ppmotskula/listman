@@ -1,0 +1,271 @@
+#!/usr/bin/perl
+# listman by Peeter P. Mõtsküla <peeterpaul@motskula.net>
+# 2011-09-26 WIP
+
+use strict;
+use MIME::Base64;
+
+# configuration ###
+
+  my $listOwner = 'your.address@somewhere.net'; # admin's email address
+  my $listName = 'list.address@somewhere.net'; # list's email address
+  my $listTag = '[SMS] '; # use your own if you want
+  my $listHome = '/path/to/list/folder'; # on your server
+  my $listUsers = "$listHome/$listName"; # will contain listmembers
+  my $listPasswd = 'admin-pass'; # change it, really!
+  my $maxBody = 1000; # cut-off point for long messages
+  my $mailCmd = '$mail = "|/usr/sbin/sendmail -f $listName $reply"'; # mail command
+  my $goodSenders = '(?:@.*\.ee|@gmail\.com)$'; # regexp for allowed sender addresses (spam protection); set to '.*' for no spam protection at all
+
+# global variables - most of them really shouldn't be global but this is still WIP ###
+
+  my ($body, $sender, $reply, $subject, $from, $to, $replyto, $mail, $address, $passwd, $msg, $list);
+
+# main block
+
+if (&readMail) {
+  if (($subject =~ /\A\s*subscribe/i) or ($body =~ /\A\s*subscribe/i)) { &subscribe; exit }
+  if (($subject =~ /\A\s*unsubscribe/i) or ($body =~ /\A\s*unsubscribe/i)) { &unsubscribe; exit }
+  if (($subject =~ /\A\s*who\Z/i) or ($body =~ /\A\s*who/i)) { &who; exit }
+  if (($subject =~ /\A\s*test\Z/i) or ($body =~ /\A\s*test/i)) { &test; exit }
+  &sendmail;
+}
+
+sub readMail {
+  my $base64;
+  while (<STDIN>) {
+    chomp;
+    last unless $_;
+    if (/\ATo: (.*)/i) { $to = $1; next }
+    if (/\AFrom: (.*)/i) { $from = $1; next }
+    if (/\AReply-To: (.*)/i) { $replyto = $1; next }
+    if (/\ASubject: (.*)/i) { $subject = $1; next }
+    if (/\AContent-transfer-encoding: base64/i) { $base64 = 1; next }
+  }
+  if ($to =~ /<(.*?)>/) { $to = $1 }
+  if ($from =~ /<(.*?)>/) { $from = $1 }
+  if ($replyto =~ /<(.*?)/) { $replyto = $1 }
+  $body = '';
+  while (<STDIN>) { $body .= "$_"; }
+  if ($base64) { $body = decode_base64($body) }
+  if (length($body) > $maxBody) {
+    &msgMailTooBig;
+    return 0;
+    exit;
+  }
+  unless ($reply = $replyto || $from) { return 0; exit };
+  $sender = $reply;
+  unless ($sender =~ /$goodSenders/) { # SPAM!
+    return 0;
+    exit;
+  }
+  if (($sender =~ /mailer/i) or ($sender =~ /postmaster/i)) {
+    $reply = $listOwner;
+    eval $mailCmd;
+    open MAIL, $mail or die;
+    print MAIL "From: $sender\nTo: $reply\nSubject: $subject\n\n";
+    print MAIL "$body";
+    close MAIL;
+    return 0;
+    exit;
+  }
+  return 1;
+}
+
+sub subscribe {
+  if ($subject =~ /\A\s*subscribe/i) { $msg = $subject } else { $msg = $body }
+  $msg =~ s/\A\s*subscribe *//si;
+  $msg =~ s/\n.*//s;
+  $msg =~ s/ *\Z//;
+  if (!$msg) { $address = $from; $passwd = $listPasswd } else {
+    $msg =~ /\A(.*?) +(.*)/;
+    $address = $1;
+    $passwd = $2;
+  }
+  if ($_ = &subscribed) { &msgAlreadySubscribed; exit }
+  if ($passwd ne $listPasswd) { &msgAuthSubscribe; exit }
+  open LIST, ">>$listUsers";
+  print LIST "$address\n";
+  close LIST;
+  &msgSubscribed;
+}
+
+sub unsubscribe {
+  if ($subject =~ /\A\s*unsubscribe/i) { $msg = $subject } else { $msg = $body }
+  $msg =~ s/\A\s*unsubscribe *//si;
+  $msg =~ s/\n.*//s;
+  $msg =~ s/ *\Z//;
+  if (!$msg) { $address = $from; $passwd = $listPasswd } else {
+    $msg =~ /\A(.*?) +(.*)/;
+    $address = $1;
+    $passwd = $2;
+  }
+  if (not($_=&subscribed)) { &msgNotSubscribed; exit }
+  if ($passwd ne $listPasswd) { &msgAuthUnsubscribe; exit }
+  $list="";
+  open LIST, "$listUsers";
+  while (<LIST>) { chomp; $list .= "$_\n" unless (/\A$address\Z/i) }
+  close LIST;
+  open LIST, ">$listUsers";
+  print LIST $list;
+  close LIST;
+  &msgUnsubscribed;
+}
+
+sub who {
+  eval $mailCmd;
+  open MAIL, $mail or die;
+  print MAIL "From: $listName\nTo: $reply\nSubject: List members\n\n";
+  open LIST, "$listUsers";
+  while (<LIST>) { print MAIL }
+  close LIST;
+  close MAIL;
+}
+
+sub test {
+  eval $mailCmd;
+  open MAIL, $mail or die;
+  print MAIL "From: $listName\nTo: $reply\nSubject: test\n\n";
+  print MAIL "test OK";
+  close MAIL;
+}
+
+sub sendmail {
+  open LIST, "$listUsers";
+  while (<LIST>) {
+    chomp;
+    $reply = $_;
+    eval $mailCmd;
+    open MAIL, $mail or die;
+    print MAIL "From: $sender\nTo: $reply\nSubject: $listTag$subject\n\n$listTag$body";
+    close MAIL;
+  }
+  close LIST
+}
+
+sub subscribed {
+  open LIST, "$listUsers";
+  while (<LIST>) {
+    chomp;
+    if (/\A$address\Z/i) { return 1; exit }
+  }
+  return 0;
+}
+
+sub msgMailTooBig {
+  eval $mailCmd;
+  open MAIL, $mail or die;
+  print MAIL "From: $listName\nTo: $reply\nSubject: Message too large\n\n";
+  print MAIL "Your message (Subject: $subject) was not sent to the list because it was too large.\n";
+  close MAIL;
+}
+
+sub msgAlreadySubscribed {
+  eval $mailCmd;
+  open MAIL, $mail or die;
+  print MAIL "From: $listName\nTo: $reply\nSubject: Already subscribed\n\n";
+  print MAIL "You are already subscribed to $listName as $address.\n";
+  close MAIL;
+}
+
+sub msgAuthSubscribe {
+  eval $mailCmd;
+  open MAIL, $mail or die;
+  print MAIL "From: $listName\nTo: $reply\nSubject: SUBSCRIBE authorization required\n\n";
+  print MAIL "Your request to subscribe $address to $listName has been forwarded to the list owner for confirmation.\n";
+  close MAIL;
+
+  $reply = $listOwner;
+  eval $mailCmd;
+  open MAIL, $mail or die;
+  print MAIL "From: $listName\nTo: $reply\nSubject: SUBSCRIBE authorization required\n\n";
+  print MAIL "From: $from\nsubscribe $address $passwd.\n";
+  close MAIL;
+}
+
+sub msgSubscribed {
+  eval $mailCmd;
+  open MAIL, $mail or die;
+  print MAIL "From: $listName\nTo: $reply\nSubject: Subscribe OK\n\n";
+  print MAIL "$address has been subscribed to $listName.\n";
+  close MAIL;
+  
+  if ($address ne $from) {
+    $reply = $address;
+    eval $mailCmd;
+    open MAIL, $mail or die;
+    print MAIL "From: $listName\nTo: $reply\nSubject: Subscribe OK\n\n";
+    print MAIL "You have been subscribed to $listName as $address by $from.\n";
+    close MAIL;
+  }
+
+  $reply = $listOwner;
+  eval $mailCmd;
+  open MAIL, $mail or die;
+  print MAIL "From: $listName\nTo: $reply\nSubject: Subscribe OK\n\n";
+  print MAIL "$from has subscribed $address to $listName.\n";
+  close MAIL;
+}
+
+sub msgNotSubscribed {
+  eval $mailCmd;
+  open MAIL, $mail or die;
+  print MAIL "From: $listName\nTo: $reply\nSubject: Not subscribed\n\n";
+  print MAIL "You are not subscribed to $listName as $address.\n";
+  close MAIL;
+}
+
+sub msgAuthUnsubscribe {
+  eval $mailCmd;
+  open MAIL, $mail or die;
+  print MAIL "From: $listName\nTo: $reply\nSubject: UNSUBSCRIBE authorization required\n\n";
+  print MAIL "Your request to unsubscribe $address to $listName has been forwarded to the list owner for confirmation.\n";
+  close MAIL;
+
+  $reply = $listOwner;
+  eval $mailCmd;
+  open MAIL, $mail or die;
+  print MAIL "From: $listName\nTo: $reply\nSubject: UNSUBSCRIBE authorization required\n\n";
+  print MAIL "From: $from\nunsubscribe $address $passwd\n";
+  close MAIL;
+}
+
+sub msgUnsubscribed {
+  eval $mailCmd;
+  open MAIL, $mail or die;
+  print MAIL "From: $listName\nTo: $reply\nSubject: Unsubscribe OK\n\n";
+  print MAIL "$address has been unsubscribed from $listName.\n";
+  close MAIL;
+  
+  if ($address ne $from) {
+    $reply = $address;
+    eval $mailCmd;
+    open MAIL, $mail or die;
+    print MAIL "From: $listName\nTo: $reply\nSubject: Unsubscribe OK\n\n";
+    print MAIL "You have been unsubscribed from $listName as $address by $from.\n";
+    close MAIL;
+  }
+
+  $reply = $listOwner;
+  eval $mailCmd;
+  open MAIL, $mail or die;
+  print MAIL "From: $listName\nTo: $reply\nSubject: Unsubscribe OK\n\n";
+  print MAIL "$from has unsubscribed $address from $listName.\n";
+  close MAIL;
+}
+
+sub getTime {
+# getTime();
+  my ($ss,$mm,$hh,$dd,$MM,$yy,$wd,$yd) = localtime(time);
+  $yy+=1900;
+  $MM++;
+  if ($ss =~ /\A.\Z/) { $ss = "0$ss" }
+  if ($mm =~ /\A.\Z/) { $mm = "0$mm" }
+  if ($hh =~ /\A.\Z/) { $hh = "0$hh" }
+  if ($dd =~ /\A.\Z/) { $dd = "0$dd" }
+  if ($MM =~ /\A.\Z/) { $MM = "0$MM" }
+  if ($yy =~ /\A.\Z/) { $yy = "0$yy" }
+  $wd = ("Sun","Mon","Tue","Wed","Thu","Fri","Sat")[$wd];
+  return "$yy\-$MM\-$dd $hh:$mm:$ss";
+}
+
